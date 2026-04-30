@@ -5,11 +5,13 @@ package drive
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/httpmock"
+	"github.com/larksuite/cli/internal/output"
 )
 
 func decodeJSONMap(t *testing.T, raw string) map[string]interface{} {
@@ -289,6 +291,186 @@ func TestParseCommentReplyElementsEscapesAngleBrackets(t *testing.T) {
 	}
 	if got[0]["text"] != "a &lt; b &gt; c" {
 		t.Fatalf("expected escaped text, got %#v", got[0]["text"])
+	}
+}
+
+func TestParseCommentReplyElementsTextLength(t *testing.T) {
+	t.Parallel()
+
+	// Cap is 10000 runes total across all reply_elements text fields,
+	// empirically derived from the live API. See the comment on
+	// maxCommentTotalRunes for the probe results.
+	exactCapASCII := strings.Repeat("a", 10000)
+	overCapASCII := strings.Repeat("a", 10001)
+
+	// Chinese chars cost 3 bytes each in UTF-8 but the server counts
+	// runes, not bytes — so the cap is the same 10000 here.
+	exactCapCJK := strings.Repeat("文", 10000)
+	overCapCJK := strings.Repeat("文", 10001)
+
+	// '<' would expand to '&lt;' (4 bytes) under escapeCommentText, but
+	// since the server counts raw runes the cap is still 10000 chars,
+	// not 2500. This pins that distinction.
+	exactCapAngle := strings.Repeat("<", 10000)
+	overCapAngle := strings.Repeat("<", 10001)
+
+	// Two-element split exactly hitting the cap together.
+	splitFiveK := strings.Repeat("a", 5000)
+	splitFiveKPlusOne := strings.Repeat("a", 5001)
+
+	tests := []struct {
+		name      string
+		input     string
+		wantErr   string
+		wantHint  string // substring of the hint portion; "" means don't check hint
+		wantCount int    // expected parsed element count when no error expected
+	}{
+		{
+			name:      "single element exactly at 10000 ASCII chars accepted",
+			input:     `[{"type":"text","text":"` + exactCapASCII + `"}]`,
+			wantCount: 1,
+		},
+		{
+			name:     "single element at 10001 ASCII chars rejected",
+			input:    `[{"type":"text","text":"` + overCapASCII + `"}]`,
+			wantErr:  "totals 10001 characters at element #1",
+			wantHint: "splitting one long element into multiple smaller text elements does NOT help",
+		},
+		{
+			name:      "single element exactly at 10000 chinese chars accepted (server counts runes, not bytes)",
+			input:     `[{"type":"text","text":"` + exactCapCJK + `"}]`,
+			wantCount: 1,
+		},
+		{
+			name:    "single element at 10001 chinese chars rejected",
+			input:   `[{"type":"text","text":"` + overCapCJK + `"}]`,
+			wantErr: "totals 10001 characters at element #1",
+		},
+		{
+			name:      "10000 angle brackets accepted (server counts raw runes, not escaped form)",
+			input:     `[{"type":"text","text":"` + exactCapAngle + `"}]`,
+			wantCount: 1,
+		},
+		{
+			name:    "10001 angle brackets rejected (escape state irrelevant to cap)",
+			input:   `[{"type":"text","text":"` + overCapAngle + `"}]`,
+			wantErr: "totals 10001 characters at element #1",
+		},
+		{
+			// Pins the multi-element TOTAL cap: two 5000-char elements
+			// fit together exactly (10000 sum). This is the boundary the
+			// previous PR's "split into multiple elements" advice
+			// implied was a workaround — it's actually only valid if
+			// the sum still fits.
+			name:      "two elements totalling exactly 10000 accepted",
+			input:     `[{"type":"text","text":"` + splitFiveK + `"},{"type":"text","text":"` + splitFiveK + `"}]`,
+			wantCount: 2,
+		},
+		{
+			// Companion to the above and the headline reason the prior
+			// "split into multiple elements" hint is wrong: 5000+5001
+			// sums to 10001 which the server rejects with the same
+			// opaque [1069302], regardless of how many elements it's
+			// distributed across.
+			name:     "two elements totalling 10001 rejected with index pointing at offending element",
+			input:    `[{"type":"text","text":"` + splitFiveK + `"},{"type":"text","text":"` + splitFiveKPlusOne + `"}]`,
+			wantErr:  "totals 10001 characters at element #2",
+			wantHint: "splitting one long element into multiple smaller text elements does NOT help",
+		},
+		{
+			// Streaming-cap correctness: when an EARLY element by itself
+			// already overshoots, the index reported is that early
+			// element (not the last one in the array).
+			name:    "first element over the cap reports index 1",
+			input:   `[{"type":"text","text":"` + overCapASCII + `"},{"type":"text","text":"trailing"}]`,
+			wantErr: "totals 10001 characters at element #1",
+		},
+		{
+			// mention_user / link elements don't count toward the
+			// rune cap (their content is ID / URL, not user-visible
+			// running text). Pin that a moderate text plus a mention
+			// stays accepted even though the mention adds bytes.
+			name:      "text plus mention_user does not double-count toward cap",
+			input:     `[{"type":"text","text":"` + exactCapASCII + `"},{"type":"mention_user","text":"ou_1234567890abcdef"}]`,
+			wantCount: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseCommentReplyElements(tt.input)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil (parsed %d elements)", tt.wantErr, len(got))
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+				}
+				if tt.wantHint != "" {
+					// Hint lives on ExitError.Detail.Hint, not err.Error().
+					var exitErr *output.ExitError
+					if !errors.As(err, &exitErr) || exitErr.Detail == nil {
+						t.Fatalf("expected ExitError with Detail, got %T (%v)", err, err)
+					}
+					if !strings.Contains(exitErr.Detail.Hint, tt.wantHint) {
+						t.Errorf("expected hint substring %q, got %q", tt.wantHint, exitErr.Detail.Hint)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != tt.wantCount {
+				t.Fatalf("expected %d reply elements, got %d", tt.wantCount, len(got))
+			}
+		})
+	}
+}
+
+// TestParseCommentReplyElementsHintForbidsSplitAdvice pins that the
+// over-cap hint does NOT recommend splitting into multiple text
+// elements as a workaround. An earlier version of this PR shipped
+// that advice; live-API probing showed the cap is on the *total* run
+// of characters across all reply_elements, so splitting doesn't
+// bypass it. If the hint ever drifts back into recommending a split,
+// users will be sent down a dead end where their first attempt fails
+// pre-flight, their "fixed" attempt also fails server-side, and
+// they're stuck.
+func TestParseCommentReplyElementsHintForbidsSplitAdvice(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseCommentReplyElements(`[{"type":"text","text":"` + strings.Repeat("a", 10001) + `"}]`)
+	if err == nil {
+		t.Fatal("expected over-cap error, got nil")
+	}
+	var exitErr *output.ExitError
+	if !errors.As(err, &exitErr) || exitErr.Detail == nil {
+		t.Fatalf("expected ExitError with Detail, got %T (%v)", err, err)
+	}
+	hint := exitErr.Detail.Hint
+
+	// The hint must explicitly call out that splitting does NOT help.
+	if !strings.Contains(hint, "does NOT help") {
+		t.Errorf("hint must explicitly say splitting does NOT help, got: %q", hint)
+	}
+	// Anti-pattern check: the hint must not phrase any "split into
+	// multiple elements" recommendation as a workaround. Look for the
+	// previous PR's exact phrasing variants.
+	for _, banned := range []string{
+		"split the content across multiple",
+		"split into multiple text elements",
+		"renders them as one contiguous comment",
+	} {
+		if strings.Contains(hint, banned) {
+			t.Errorf("hint must not contain the discredited %q advice, got: %q", banned, hint)
+		}
+	}
+	// And it should reference the actual number so callers know the
+	// budget without having to read the source.
+	if !strings.Contains(hint, "10000") {
+		t.Errorf("hint should name the 10000-rune budget, got: %q", hint)
 	}
 }
 
