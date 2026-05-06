@@ -259,10 +259,15 @@ func TestBaseRecordReadHelpGuidesAgents(t *testing.T) {
 			name:     "record get",
 			shortcut: BaseRecordGet,
 			wantHelp: []string{
-				"record ID",
+				"record ID (repeatable)",
+				"field ID or name to project; repeat to keep only needed columns",
+				"output format: markdown (default) | json",
 			},
 			wantTips: []string{
 				"lark-cli base +record-get --base-token <base_token> --table-id <table_id> --record-id <record_id>",
+				"lark-cli base +record-get --base-token <base_token> --table-id <table_id> --record-id rec_001 --record-id rec_002 --field-id Name --field-id Status",
+				"Default output is markdown",
+				"projection boundary",
 				"record_id is already known",
 				"lark-base record read SOP",
 			},
@@ -355,8 +360,8 @@ func TestBaseRecordValidate(t *testing.T) {
 	if BaseRecordSearch.Validate == nil {
 		t.Fatalf("record search validate should reject invalid JSON before dry-run")
 	}
-	if BaseRecordGet.Validate != nil {
-		t.Fatalf("record get validate should be nil")
+	if BaseRecordGet.Validate == nil {
+		t.Fatalf("record get validate should reject invalid record selection before dry-run")
 	}
 	if BaseRecordUpsert.Validate == nil {
 		t.Fatalf("record upsert validate should reject invalid JSON before dry-run")

@@ -24,6 +24,10 @@ func validateRecordReadFormat(runtime *common.RuntimeContext) error {
 }
 
 func outputRecordMarkdown(runtime *common.RuntimeContext, data map[string]interface{}) error {
+	return outputRecordMarkdownWithRenderer(runtime, data, renderRecordMarkdown)
+}
+
+func outputRecordMarkdownWithRenderer(runtime *common.RuntimeContext, data map[string]interface{}, renderer func(map[string]interface{}) (string, error)) error {
 	if runtime.JqExpr != "" {
 		if !runtime.Changed("format") {
 			runtime.Out(data, nil)
@@ -31,7 +35,7 @@ func outputRecordMarkdown(runtime *common.RuntimeContext, data map[string]interf
 		}
 		return output.ErrValidation("--jq and --format markdown are mutually exclusive")
 	}
-	rendered, err := renderRecordMarkdown(data)
+	rendered, err := renderer(data)
 	if err != nil {
 		fmt.Fprintf(runtime.IO().ErrOut, "warning: record markdown render failed, falling back to json: %v\n", err)
 		runtime.Out(data, nil)
@@ -46,6 +50,27 @@ func outputRecordMarkdown(runtime *common.RuntimeContext, data map[string]interf
 	}
 	fmt.Fprint(runtime.IO().Out, rendered)
 	return nil
+}
+
+func outputRecordGetMarkdown(runtime *common.RuntimeContext, data map[string]interface{}) error {
+	return outputRecordMarkdownWithRenderer(runtime, data, renderRecordGetMarkdown)
+}
+
+func renderRecordGetMarkdown(data map[string]interface{}) (string, error) {
+	fields := stringSliceValue(data["fields"])
+	recordIDs := stringSliceValue(data["record_id_list"])
+	rows, ok := data["data"].([]interface{})
+	if len(fields) == 0 || !ok {
+		return "", output.ErrValidation("--format markdown requires record matrix response with fields, record_id_list, and data")
+	}
+	if len(recordIDs) == 1 && len(rows) == 1 {
+		rowItems, _ := rows[0].([]interface{})
+		if recordMarkedNotFound(data["record_not_found"], recordIDs[0]) {
+			return renderMissingSingleRecordMarkdown(recordIDs[0], data), nil
+		}
+		return renderSingleRecordMarkdown(recordIDs[0], fields, rowItems, data), nil
+	}
+	return renderRecordMarkdown(data)
 }
 
 func renderRecordMarkdown(data map[string]interface{}) (string, error) {
@@ -91,7 +116,66 @@ func renderRecordMarkdown(data map[string]interface{}) (string, error) {
 		b.WriteString(ignored)
 		b.WriteByte('\n')
 	}
+	if missing := recordNotFoundMarkdown(data["record_not_found"]); missing != "" {
+		b.WriteString("Missing records: ")
+		b.WriteString(missing)
+		b.WriteByte('\n')
+	}
 	return b.String(), nil
+}
+
+func renderSingleRecordMarkdown(recordID string, fields []string, rowItems []interface{}, data map[string]interface{}) string {
+	var b strings.Builder
+	b.WriteString("`_record_id` is metadata for record operations, not a table field.\n\n")
+	b.WriteString("- `_record_id`: ")
+	b.WriteString(markdownInlineValue(recordID))
+	b.WriteByte('\n')
+	for i, field := range fields {
+		b.WriteString("- `")
+		b.WriteString(field)
+		b.WriteString("`: ")
+		if i < len(rowItems) {
+			b.WriteString(markdownInlineValue(rowItems[i]))
+		}
+		b.WriteByte('\n')
+	}
+	meta := recordMarkdownMeta(data)
+	if len(meta) > 0 {
+		b.WriteString("\nMeta: ")
+		b.WriteString(strings.Join(meta, "; "))
+		b.WriteByte('\n')
+	}
+	if ignored := ignoredFieldsMarkdown(data["ignored_fields"]); ignored != "" {
+		b.WriteString("Ignored fields: ")
+		b.WriteString(ignored)
+		b.WriteByte('\n')
+	}
+	if missing := recordNotFoundMarkdown(data["record_not_found"]); missing != "" {
+		b.WriteString("Missing records: ")
+		b.WriteString(missing)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func renderMissingSingleRecordMarkdown(recordID string, data map[string]interface{}) string {
+	var b strings.Builder
+	b.WriteString("Record not found.\n\n")
+	b.WriteString("- `_record_id`: ")
+	b.WriteString(markdownInlineValue(recordID))
+	b.WriteByte('\n')
+	meta := recordMarkdownMeta(data)
+	if len(meta) > 0 {
+		b.WriteString("\nMeta: ")
+		b.WriteString(strings.Join(meta, "; "))
+		b.WriteByte('\n')
+	}
+	if missing := recordNotFoundMarkdown(data["record_not_found"]); missing != "" {
+		b.WriteString("Missing records: ")
+		b.WriteString(missing)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func recordMarkdownMeta(data map[string]interface{}) []string {
@@ -108,6 +192,9 @@ func recordMarkdownMeta(data map[string]interface{}) []string {
 	}
 	if ignoredCount := ignoredFieldsCount(data["ignored_fields"]); ignoredCount > 0 {
 		meta = append(meta, fmt.Sprintf("ignored_fields=%d", ignoredCount))
+	}
+	if missingCount := ignoredFieldsCount(data["record_not_found"]); missingCount > 0 {
+		meta = append(meta, fmt.Sprintf("record_not_found=%d", missingCount))
 	}
 	return meta
 }
@@ -136,6 +223,19 @@ func ignoredFieldsMarkdown(value interface{}) string {
 		items = append(items, fmt.Sprintf("...(%d total)", total))
 	}
 	return strings.Join(items, ", ")
+}
+
+func recordNotFoundMarkdown(value interface{}) string {
+	return strings.Join(markdownListItems(value), ", ")
+}
+
+func recordMarkedNotFound(value interface{}, recordID string) bool {
+	for _, item := range markdownListItems(value) {
+		if item == recordID {
+			return true
+		}
+	}
+	return false
 }
 
 func markdownListItems(value interface{}) []string {

@@ -83,6 +83,75 @@ func TestRenderRecordMarkdownEscapesTableCells(t *testing.T) {
 	}
 }
 
+func TestRenderRecordGetMarkdownSingleRecordUsesKVLayout(t *testing.T) {
+	got, err := renderRecordGetMarkdown(map[string]interface{}{
+		"fields":         []interface{}{"Name|Label", "Note"},
+		"record_id_list": []interface{}{"rec_1"},
+		"data":           []interface{}{[]interface{}{"A|B", "line1\nline2"}},
+		"has_more":       false,
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	for _, want := range []string{
+		"- `_record_id`: rec_1",
+		"- `Name|Label`: A|B",
+		"- `Note`: line1\nline2",
+		"Meta: count=1; has_more=false",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderRecordGetMarkdownSingleMissingRecordUsesNotFoundLayout(t *testing.T) {
+	got, err := renderRecordGetMarkdown(map[string]interface{}{
+		"fields":           []interface{}{"Name", "Note"},
+		"record_id_list":   []interface{}{"rec_missing"},
+		"data":             []interface{}{[]interface{}{nil, nil}},
+		"record_not_found": []interface{}{"rec_missing"},
+		"has_more":         false,
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	for _, want := range []string{
+		"Record not found.",
+		"- `_record_id`: rec_missing",
+		"Meta: count=1; has_more=false; record_not_found=1",
+		"Missing records: rec_missing",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "- `Name`:") {
+		t.Fatalf("missing record layout should not render business fields:\n%s", got)
+	}
+}
+
+func TestRenderRecordMarkdownIncludesMissingRecords(t *testing.T) {
+	got, err := renderRecordMarkdown(map[string]interface{}{
+		"fields":           []interface{}{"Name"},
+		"record_id_list":   []interface{}{"rec_1", "rec_missing"},
+		"data":             []interface{}{[]interface{}{"Alice"}, []interface{}{nil}},
+		"record_not_found": []interface{}{"rec_missing"},
+		"has_more":         false,
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	for _, want := range []string{
+		"Meta: count=2; has_more=false; record_not_found=1",
+		"Missing records: rec_missing",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRenderRecordMarkdownTruncatesIgnoredFields(t *testing.T) {
 	ignored := make([]interface{}, maxRecordMarkdownIgnoredFields+2)
 	for i := range ignored {
