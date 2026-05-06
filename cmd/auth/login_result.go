@@ -169,7 +169,7 @@ func handleLoginScopeIssue(opts *LoginOptions, msg *loginMsg, f *cmdutil.Factory
 		if loginSucceeded {
 			b, _ := json.Marshal(authorizationCompletePayload(openId, userName, issue.Summary, issue))
 			fmt.Fprintln(f.IOStreams.Out, string(b))
-			return nil
+			return output.ErrBare(output.ExitAuth)
 		}
 		detail := map[string]interface{}{
 			"requested": issue.Summary.Requested,
@@ -199,9 +199,6 @@ func handleLoginScopeIssue(opts *LoginOptions, msg *loginMsg, f *cmdutil.Factory
 	writeLoginScopeBreakdown(f.IOStreams, msg, issue.Summary)
 	if issue.Hint != "" {
 		fmt.Fprintln(f.IOStreams.ErrOut, issue.Hint)
-	}
-	if loginSucceeded {
-		return nil
 	}
 	return output.ErrBare(output.ExitAuth)
 }
