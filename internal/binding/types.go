@@ -169,7 +169,7 @@ type ProviderConfig struct {
 const (
 	DefaultFileTimeoutMs      = 5000
 	DefaultFileMaxBytes       = 1024 * 1024 // 1 MiB
-	DefaultExecTimeoutMs      = 5000
+	DefaultExecTimeoutMs      = 10000
 	DefaultExecMaxOutputBytes = 1024 * 1024 // 1 MiB
 )
 

@@ -15,6 +15,22 @@ make unit-test      # Required before PR (runs with -race)
 make test           # Full: vet + unit + integration
 ```
 
+## Notification Opt-Outs
+
+`lark-cli` emits two notice types into JSON envelope `_notice` to nudge AI agents toward fixes:
+
+- `_notice.update` — a newer binary is available on npm
+- `_notice.skills` — locally installed skills are out of sync with the running binary
+
+To suppress them in non-CI scripts (CI envs are auto-skipped):
+
+| Env var | Effect |
+|---------|--------|
+| `LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1` | Suppress `_notice.update` |
+| `LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1` | Suppress `_notice.skills` |
+
+Both notices recommend the same fix command: `lark-cli update`. The skills notice's `current` field is `""` when skills have never been synced (cold start) and a version string when synced for an older binary (drift).
+
 ## Pre-PR Checks (match CI gates)
 
 1. `make unit-test`

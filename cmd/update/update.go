@@ -14,13 +14,15 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/selfupdate"
+	"github.com/larksuite/cli/internal/skillscheck"
 	"github.com/larksuite/cli/internal/update"
 )
 
 const (
-	repoURL      = "https://github.com/larksuite/cli"
-	maxNpmOutput = 2000
-	osWindows    = "windows"
+	repoURL         = "https://github.com/larksuite/cli"
+	maxNpmOutput    = 2000
+	maxStderrDetail = 500
+	osWindows       = "windows"
 )
 
 // Overridable for testing.
@@ -32,6 +34,13 @@ var (
 )
 
 func isWindows() bool { return currentOS == osWindows }
+
+// normalizeVersion canonicalizes a version string for stamp comparison.
+// Strips a leading "v" so versions written from Makefile (git describe →
+// "v1.0.0") and npm (no prefix → "1.0.0") compare equal.
+func normalizeVersion(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
+}
 
 func releaseURL(version string) string {
 	return repoURL + "/releases/tag/v" + strings.TrimPrefix(version, "v")
@@ -127,16 +136,15 @@ func updateRun(opts *UpdateOptions) error {
 
 	// 3. Compare versions
 	if !opts.Force && !update.IsNewer(latest, cur) {
-		if opts.JSON {
-			output.PrintJson(io.Out, map[string]interface{}{
-				"ok": true, "previous_version": cur, "current_version": cur,
-				"latest_version": latest, "action": "already_up_to_date",
-				"message": fmt.Sprintf("lark-cli %s is already up to date", cur),
-			})
-			return nil
+		// Run skills sync before returning — covers the case where the
+		// binary is already current but skills were never synced.
+		// Stamp dedup makes this a no-op if skills are already in sync.
+		// Skip side-effects under --check (pure report path per spec §3.6).
+		var skillsResult *selfupdate.NpmResult
+		if !opts.Check {
+			skillsResult = runSkillsAndStamp(updater, io, cur, opts.Force)
 		}
-		fmt.Fprintf(io.ErrOut, "%s lark-cli %s is already up to date\n", symOK(), cur)
-		return nil
+		return reportAlreadyUpToDate(opts, io, cur, latest, skillsResult, opts.Check)
 	}
 
 	// 4. Detect installation method
@@ -149,7 +157,7 @@ func updateRun(opts *UpdateOptions) error {
 
 	// 6. Execute update
 	if !detect.CanAutoUpdate() {
-		return doManualUpdate(opts, io, cur, latest, detect)
+		return doManualUpdate(opts, io, cur, latest, detect, updater)
 	}
 	return doNpmUpdate(opts, io, cur, latest, updater)
 }
@@ -169,13 +177,24 @@ func reportError(opts *UpdateOptions, io *cmdutil.IOStreams, exitCode int, errTy
 
 func reportCheckResult(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string, canAutoUpdate bool) error {
 	if opts.JSON {
-		output.PrintJson(io.Out, map[string]interface{}{
+		out := map[string]interface{}{
 			"ok": true, "previous_version": cur, "current_version": cur,
 			"latest_version": latest, "action": "update_available",
 			"auto_update": canAutoUpdate,
 			"message":     fmt.Sprintf("lark-cli %s %s %s available", cur, symArrow(), latest),
 			"url":         releaseURL(latest), "changelog": changelogURL(),
-		})
+		}
+		// skills_status: pure report, no side effect, no stamp write.
+		// ReadStamp errors are silently swallowed — if we can't read the
+		// stamp we just omit the block rather than fail the --check.
+		if stamp, err := skillscheck.ReadStamp(); err == nil {
+			out["skills_status"] = map[string]interface{}{
+				"current": stamp,
+				"target":  cur,
+				"in_sync": stamp == cur,
+			}
+		}
+		output.PrintJson(io.Out, out)
 		return nil
 	}
 	fmt.Fprintf(io.ErrOut, "Update available: %s %s %s\n", cur, symArrow(), latest)
@@ -189,15 +208,19 @@ func reportCheckResult(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest s
 	return nil
 }
 
-func doManualUpdate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string, detect selfupdate.DetectResult) error {
+func doManualUpdate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string, detect selfupdate.DetectResult, updater *selfupdate.Updater) error {
+	skillsResult := runSkillsAndStamp(updater, io, cur, opts.Force)
+
 	reason := detect.ManualReason()
 	if opts.JSON {
-		output.PrintJson(io.Out, map[string]interface{}{
+		out := map[string]interface{}{
 			"ok": true, "previous_version": cur, "latest_version": latest,
 			"action":  "manual_required",
 			"message": fmt.Sprintf("Automatic update unavailable: %s (path: %s)", reason, detect.ResolvedPath),
 			"url":     releaseURL(latest), "changelog": changelogURL(),
-		})
+		}
+		applySkillsResult(out, skillsResult)
+		output.PrintJson(io.Out, out)
 		return nil
 	}
 	fmt.Fprintf(io.ErrOut, "Automatic update unavailable: %s (path: %s).\n\n", reason, detect.ResolvedPath)
@@ -205,7 +228,7 @@ func doManualUpdate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest stri
 	fmt.Fprintf(io.ErrOut, "  Release:   %s\n", releaseURL(latest))
 	fmt.Fprintf(io.ErrOut, "  Changelog: %s\n", changelogURL())
 	fmt.Fprintf(io.ErrOut, "\nOr install via npm:\n  npm install -g %s@%s\n", selfupdate.NpmPackage, latest)
-	fmt.Fprintf(io.ErrOut, "\nAfter updating, also update skills:\n  npx -y skills add larksuite/cli -g -y\n")
+	emitSkillsTextHints(io, skillsResult)
 	return nil
 }
 
@@ -264,8 +287,10 @@ func doNpmUpdate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string,
 		return output.ErrBare(output.ExitAPI)
 	}
 
-	// Skills update (best-effort).
-	skillsResult := updater.RunSkillsUpdate()
+	// Skills update (best-effort) — uses runSkillsAndStamp so the
+	// stamp gets persisted on success and dedup applies if a previous
+	// run already stamped this version.
+	skillsResult := runSkillsAndStamp(updater, io, latest, opts.Force)
 
 	if opts.JSON {
 		result := map[string]interface{}{
@@ -274,28 +299,17 @@ func doNpmUpdate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string,
 			"message": fmt.Sprintf("lark-cli updated from %s to %s", cur, latest),
 			"url":     releaseURL(latest), "changelog": changelogURL(),
 		}
-		if skillsResult.Err != nil {
-			result["skills_warning"] = fmt.Sprintf("skills update failed: %s", skillsResult.Err)
-			if detail := strings.TrimSpace(skillsResult.Stderr.String()); detail != "" {
-				result["skills_detail"] = selfupdate.Truncate(detail, maxNpmOutput)
-			}
-		}
+		applySkillsResult(result, skillsResult)
 		output.PrintJson(io.Out, result)
 		return nil
 	}
 
 	fmt.Fprintf(io.ErrOut, "\n%s Successfully updated lark-cli from %s to %s\n", symOK(), cur, latest)
 	fmt.Fprintf(io.ErrOut, "  Changelog: %s\n", changelogURL())
-	fmt.Fprintf(io.ErrOut, "\nUpdating skills ...\n")
-	if skillsResult.Err != nil {
-		fmt.Fprintf(io.ErrOut, "%s Skills update failed: %s\n", symWarn(), skillsResult.Err)
-		if detail := strings.TrimSpace(skillsResult.Stderr.String()); detail != "" {
-			fmt.Fprintf(io.ErrOut, "  %s\n", selfupdate.Truncate(detail, 500))
-		}
-		fmt.Fprintf(io.ErrOut, "  Run manually: npx -y skills add larksuite/cli -g -y\n")
-	} else {
-		fmt.Fprintf(io.ErrOut, "%s Skills updated\n", symOK())
+	if skillsResult != nil {
+		fmt.Fprintf(io.ErrOut, "\nUpdating skills ...\n")
 	}
+	emitSkillsTextHints(io, skillsResult)
 	return nil
 }
 
@@ -311,4 +325,97 @@ func verificationFailureHint(updater *selfupdate.Updater, latest string) string 
 		return "the previous version has been restored"
 	}
 	return fmt.Sprintf("automatic rollback is unavailable on this platform; reinstall manually: npm install -g %s@%s, or download %s", selfupdate.NpmPackage, latest, releaseURL(latest))
+}
+
+// runSkillsAndStamp triggers updater.RunSkillsUpdate and persists the
+// stamp on success. Skips the npx invocation when the stamp already
+// matches stampVersion (unless force is true). The stamp write failure
+// emits a warning to io.ErrOut but does NOT fail the update command —
+// best-effort. ReadStamp errors are swallowed (fail-closed: treated as
+// out-of-sync, so npx re-runs). Returns nil iff skipped due to stamp
+// dedup; otherwise returns the underlying *NpmResult with Err semantics
+// from RunSkillsUpdate.
+func runSkillsAndStamp(updater *selfupdate.Updater, io *cmdutil.IOStreams, stampVersion string, force bool) *selfupdate.NpmResult {
+	if !force {
+		if existing, _ := skillscheck.ReadStamp(); normalizeVersion(existing) == normalizeVersion(stampVersion) {
+			return nil
+		}
+	}
+	r := updater.RunSkillsUpdate()
+	if r.Err == nil {
+		if err := skillscheck.WriteStamp(stampVersion); err != nil {
+			fmt.Fprintf(io.ErrOut, "warning: skills synced but stamp not written: %v\n", err)
+		}
+	}
+	return r
+}
+
+// reportAlreadyUpToDate emits the JSON / pretty output for the
+// already-up-to-date branch, including any skills_action / skills_warning
+// fields derived from skillsResult. When check is true, this is the pure
+// report path (spec §3.6): no side-effects, JSON envelope uses
+// skills_status (spec §4.2) instead of skills_action.
+func reportAlreadyUpToDate(opts *UpdateOptions, io *cmdutil.IOStreams, cur, latest string, skillsResult *selfupdate.NpmResult, check bool) error {
+	if opts.JSON {
+		out := map[string]interface{}{
+			"ok": true, "previous_version": cur, "current_version": cur,
+			"latest_version": latest, "action": "already_up_to_date",
+			"message": fmt.Sprintf("lark-cli %s is already up to date", cur),
+		}
+		if check {
+			// Pure report — read stamp directly, emit skills_status block.
+			// ReadStamp errors are silently swallowed — if we can't read
+			// the stamp we just omit the block rather than fail the --check.
+			if stamp, err := skillscheck.ReadStamp(); err == nil {
+				out["skills_status"] = map[string]interface{}{
+					"current": stamp,
+					"target":  cur,
+					"in_sync": stamp == cur,
+				}
+			}
+		} else {
+			applySkillsResult(out, skillsResult)
+		}
+		output.PrintJson(io.Out, out)
+		return nil
+	}
+	fmt.Fprintf(io.ErrOut, "%s lark-cli %s is already up to date\n", symOK(), cur)
+	if !check {
+		emitSkillsTextHints(io, skillsResult)
+	}
+	return nil
+}
+
+// applySkillsResult mutates the JSON envelope to include skills_action
+// (and skills_warning when failed). nil result = "in_sync" (dedup hit).
+func applySkillsResult(env map[string]interface{}, r *selfupdate.NpmResult) {
+	switch {
+	case r == nil:
+		env["skills_action"] = "in_sync"
+	case r.Err != nil:
+		env["skills_action"] = "failed"
+		env["skills_warning"] = fmt.Sprintf("skills update failed: %s", r.Err)
+		if detail := strings.TrimSpace(r.Stderr.String()); detail != "" {
+			env["skills_detail"] = selfupdate.Truncate(detail, maxNpmOutput)
+		}
+	default:
+		env["skills_action"] = "synced"
+	}
+}
+
+// emitSkillsTextHints prints human-readable feedback about the skills
+// sync result for non-JSON output.
+func emitSkillsTextHints(io *cmdutil.IOStreams, r *selfupdate.NpmResult) {
+	switch {
+	case r == nil:
+		// dedup hit — silent (already up to date)
+	case r.Err != nil:
+		fmt.Fprintf(io.ErrOut, "%s Skills update failed: %v\n", symWarn(), r.Err)
+		if detail := strings.TrimSpace(r.Stderr.String()); detail != "" {
+			fmt.Fprintf(io.ErrOut, "  %s\n", selfupdate.Truncate(detail, maxStderrDetail))
+		}
+		fmt.Fprintf(io.ErrOut, "  Run manually: npx -y skills add larksuite/cli -g -y\n")
+	default:
+		fmt.Fprintf(io.ErrOut, "%s Skills updated\n", symOK())
+	}
 }

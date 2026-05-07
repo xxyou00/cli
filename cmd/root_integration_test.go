@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,11 +15,14 @@ import (
 	"github.com/larksuite/cli/cmd/api"
 	"github.com/larksuite/cli/cmd/auth"
 	"github.com/larksuite/cli/cmd/service"
+	"github.com/larksuite/cli/internal/build"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/envvars"
 	"github.com/larksuite/cli/internal/httpmock"
 	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/skillscheck"
+	"github.com/larksuite/cli/internal/update"
 	"github.com/larksuite/cli/shortcuts"
 	"github.com/spf13/cobra"
 )
@@ -498,4 +502,182 @@ func TestIntegration_Shortcut_BusinessError_OutputsEnvelope(t *testing.T) {
 			Message: "HTTP 400: Bot/User can NOT be out of the chat.",
 		},
 	})
+}
+
+// TestSetupNotices_ColdStart verifies that when no skills stamp exists,
+// the composed PendingNotice provider includes a "skills" key with an
+// empty Current and the cold-start message.
+func TestSetupNotices_ColdStart(t *testing.T) {
+	clearNoticeEnv(t)
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+
+	origVersion := build.Version
+	build.Version = "1.0.21"
+	t.Cleanup(func() { build.Version = origVersion })
+
+	// Reset pending state to ensure a clean test.
+	skillscheck.SetPending(nil)
+	update.SetPending(nil)
+	output.PendingNotice = nil
+	t.Cleanup(func() {
+		skillscheck.SetPending(nil)
+		update.SetPending(nil)
+		output.PendingNotice = nil
+	})
+
+	setupNotices()
+
+	notice := output.GetNotice()
+	if notice == nil {
+		t.Fatal("GetNotice() = nil, want non-nil for cold start")
+	}
+	skills, ok := notice["skills"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("notice.skills missing, got %+v", notice)
+	}
+	if skills["current"] != "" || skills["target"] != "1.0.21" {
+		t.Errorf("notice.skills = %+v, want {current:\"\", target:\"1.0.21\"}", skills)
+	}
+	if msg, _ := skills["message"].(string); msg != "lark-cli skills not installed, run: lark-cli update" {
+		t.Errorf("notice.skills.message = %q, want cold-start message", msg)
+	}
+}
+
+// TestSetupNotices_InSync verifies that a matching stamp produces no
+// skills key in the composed notice.
+func TestSetupNotices_InSync(t *testing.T) {
+	clearNoticeEnv(t)
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := skillscheck.WriteStamp("1.0.21"); err != nil {
+		t.Fatal(err)
+	}
+
+	origVersion := build.Version
+	build.Version = "1.0.21"
+	t.Cleanup(func() { build.Version = origVersion })
+
+	skillscheck.SetPending(nil)
+	update.SetPending(nil)
+	output.PendingNotice = nil
+	t.Cleanup(func() {
+		skillscheck.SetPending(nil)
+		update.SetPending(nil)
+		output.PendingNotice = nil
+	})
+
+	setupNotices()
+
+	notice := output.GetNotice()
+	if notice != nil {
+		if _, ok := notice["skills"]; ok {
+			t.Errorf("notice.skills present in in-sync state: %+v", notice)
+		}
+	}
+}
+
+// TestSetupNotices_Drift verifies a mismatching stamp produces the
+// drift message with both current and target populated.
+func TestSetupNotices_Drift(t *testing.T) {
+	clearNoticeEnv(t)
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := skillscheck.WriteStamp("1.0.20"); err != nil {
+		t.Fatal(err)
+	}
+
+	origVersion := build.Version
+	build.Version = "1.0.21"
+	t.Cleanup(func() { build.Version = origVersion })
+
+	skillscheck.SetPending(nil)
+	update.SetPending(nil)
+	output.PendingNotice = nil
+	t.Cleanup(func() {
+		skillscheck.SetPending(nil)
+		update.SetPending(nil)
+		output.PendingNotice = nil
+	})
+
+	setupNotices()
+
+	notice := output.GetNotice()
+	if notice == nil {
+		t.Fatal("GetNotice() = nil, want non-nil for drift")
+	}
+	skills, ok := notice["skills"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("notice.skills missing, got %+v", notice)
+	}
+	if skills["current"] != "1.0.20" || skills["target"] != "1.0.21" {
+		t.Errorf("notice.skills = %+v, want {current:\"1.0.20\", target:\"1.0.21\"}", skills)
+	}
+	want := "lark-cli skills 1.0.20 out of sync with binary 1.0.21, run: lark-cli update"
+	if msg, _ := skills["message"].(string); msg != want {
+		t.Errorf("notice.skills.message = %q, want %q", msg, want)
+	}
+}
+
+// TestSetupNotices_BothUpdateAndSkills verifies the composed envelope
+// emits BOTH "_notice.update" and "_notice.skills" keys when each
+// pending value is set. Drives the skills key via setupNotices() (drift
+// state) and manually populates the update pending afterwards, since
+// clearNoticeEnv suppresses the update goroutine to avoid network
+// flakiness.
+func TestSetupNotices_BothUpdateAndSkills(t *testing.T) {
+	clearNoticeEnv(t)
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := skillscheck.WriteStamp("1.0.20"); err != nil {
+		t.Fatal(err)
+	}
+
+	origVersion := build.Version
+	build.Version = "1.0.21"
+	t.Cleanup(func() { build.Version = origVersion })
+
+	skillscheck.SetPending(nil)
+	update.SetPending(nil)
+	output.PendingNotice = nil
+	t.Cleanup(func() {
+		skillscheck.SetPending(nil)
+		update.SetPending(nil)
+		output.PendingNotice = nil
+	})
+
+	setupNotices()
+
+	// After setupNotices, skills pending is set (drift). Manually populate
+	// the update side so the composed envelope has both keys — the update
+	// goroutine is suppressed by clearNoticeEnv.
+	update.SetPending(&update.UpdateInfo{Current: "1.0.21", Latest: "1.0.22"})
+
+	notice := output.GetNotice()
+	if notice == nil {
+		t.Fatal("GetNotice() = nil, want both keys")
+	}
+	if _, ok := notice["update"].(map[string]interface{}); !ok {
+		t.Errorf("missing 'update' key: %+v", notice)
+	}
+	if _, ok := notice["skills"].(map[string]interface{}); !ok {
+		t.Errorf("missing 'skills' key: %+v", notice)
+	}
+}
+
+// clearNoticeEnv unsets the env vars that affect either notice. We
+// proactively SUPPRESS the update notifier (LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1)
+// because setupNotices spawns a goroutine that hits the npm registry —
+// tests focused on the skills check should not depend on network state.
+func clearNoticeEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"LARKSUITE_CLI_NO_SKILLS_NOTIFIER",
+		"CI", "BUILD_NUMBER", "RUN_ID",
+	} {
+		t.Setenv(key, "")
+		os.Unsetenv(key)
+	}
+	// Suppress the update goroutine's network call deterministically.
+	t.Setenv("LARKSUITE_CLI_NO_UPDATE_NOTIFIER", "1")
 }
