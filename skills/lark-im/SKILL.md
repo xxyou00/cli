@@ -109,7 +109,7 @@ lark-cli im <resource> <method> [flags] # 调用 API
 ### messages
 
   - `delete` — 撤回消息。Identity: supports `user` and `bot`; for `bot` calls, the bot must be in the chat to revoke group messages; to revoke another user's group message, the bot must be the owner, an admin, or the creator; for user P2P recalls, the target user must be within the bot's availability.
-  - `forward` — 转发消息。Identity: `bot` only (`tenant_access_token`).
+  - `forward` — 转发消息。Identity: supports `user` and `bot`.
   - `merge_forward` — 合并转发消息。Identity: `bot` only (`tenant_access_token`).
   - `read_users` — 查询消息已读信息。Identity: `bot` only (`tenant_access_token`); the bot must be in the chat, and can only query read status for messages it sent within the last 7 days.
 
@@ -119,6 +119,10 @@ lark-cli im <resource> <method> [flags] # 调用 API
   - `create` — 添加消息表情回复。Identity: supports `user` and `bot`; the caller must be in the conversation that contains the message.[Must-read](references/lark-im-reactions.md)
   - `delete` — 删除消息表情回复。Identity: supports `user` and `bot`; the caller must be in the conversation that contains the message, and can only delete reactions added by itself.[Must-read](references/lark-im-reactions.md)
   - `list` — 获取消息表情回复。Identity: supports `user` and `bot`; the caller must be in the conversation that contains the message.[Must-read](references/lark-im-reactions.md)
+
+### threads
+
+  - `forward` — 转发话题。Identity: supports `user` and `bot`.
 
 ### images
 
@@ -147,6 +151,7 @@ lark-cli im <resource> <method> [flags] # 调用 API
 | `messages.forward` | `im:message` |
 | `messages.merge_forward` | `im:message` |
 | `messages.read_users` | `im:message:readonly` |
+| `threads.forward` | `im:message` |
 | `reactions.batch_query` | `im:message.reactions:read` |
 | `reactions.create` | `im:message.reactions:write_only` |
 | `reactions.delete` | `im:message.reactions:write_only` |
