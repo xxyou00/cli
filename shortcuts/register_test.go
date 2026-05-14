@@ -415,7 +415,7 @@ func TestGenerateShortcutsJSON(t *testing.T) {
 		grouped[s.Service] = append(grouped[s.Service], entry{
 			Verb:        verb,
 			Description: s.Description,
-			Scopes:      s.ScopesForIdentity("user"),
+			Scopes:      s.DeclaredScopesForIdentity("user"),
 		})
 	}
 
