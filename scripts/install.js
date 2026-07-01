@@ -265,10 +265,9 @@ function getExpectedChecksum(archiveName, checksumsDir) {
   const checksumsPath = path.join(dir, "checksums.txt");
 
   if (!fs.existsSync(checksumsPath)) {
-    console.error(
-      "[WARN] checksums.txt not found, skipping checksum verification"
+    throw new Error(
+      "[SECURITY] checksums.txt not found; refusing to install an unverified binary."
     );
-    return null;
   }
 
   const content = fs.readFileSync(checksumsPath, "utf8");
@@ -286,7 +285,11 @@ function getExpectedChecksum(archiveName, checksumsDir) {
 }
 
 function verifyChecksum(archivePath, expectedHash) {
-  if (expectedHash === null) return;
+  if (typeof expectedHash !== "string" || expectedHash.length === 0) {
+    throw new Error(
+      "[SECURITY] missing expected checksum; refusing to install an unverified binary."
+    );
+  }
 
   // Stream the file to avoid loading the entire archive into memory.
   // Archives can be 10-100MB; streaming keeps RSS constant.
